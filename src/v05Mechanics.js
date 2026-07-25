@@ -1,16 +1,24 @@
 import {SPACES,shuffle} from './gameData.js';
 
-const random=a=>a[Math.floor(Math.random()*a.length)];
-const next=n=>n===9?1:n+1;
+export const COIN_CAP=30;
+export const nextSpace=(space,steps=1)=>((space-1+steps)%9)+1;
+export const addCoins=(publicState,amount)=>{
+  const before=publicState.money||0;
+  publicState.money=Math.min(COIN_CAP,before+Math.max(0,amount));
+  return publicState.money-before;
+};
 
-export function drawCards(state,hand,count){
-  for(let i=0;i<count;i++){
+export function drawCards(state,hand,count,characterId){
+  const requested=count+(characterId==='veruca'?1:0);
+  let drawn=0;
+  for(let i=0;i<requested;i++){
     if(!state.deck.length&&state.discard.length){
       state.deck=shuffle(state.discard);
       state.discard=[];
     }
-    if(state.deck.length)hand.push(state.deck.shift());
+    if(state.deck.length){hand.push(state.deck.shift());drawn++}
   }
+  return drawn;
 }
 
 export function takeBars(state,publicState,userId,count){
@@ -30,126 +38,83 @@ export function returnBars(state,publicState,userId,count){
   return owned.length;
 }
 
-export function resolveAdvancedCard({card,state,actor,actorPublic,actorHand,players,choice={}}){
-  const patches=[];
-  const log=text=>state.log.push(text);
-  switch(card.name){
-    case 'Triple-Cream Cup':{
-      const available=Object.values(actorPublic.played).flat().filter(c=>c.id!==card.id);
-      if(available.length<3)return {error:'You need three other cards below your mat.'};
-      const swept=available.slice(0,3);
-      for(const c of swept)actorPublic.played[c.type]=actorPublic.played[c.type].filter(x=>x.id!==c.id);
-      state.discard.push(...swept);
-      actorPublic.money+=5;
-      log(`${actor.name} swept 3 cards and gained $5.`);
-      break;
-    }
-    case 'Slingshot Gum':{
-      actorPublic.space=next(actorPublic.space);
-      for(const target of players.filter(p=>p.id!==actor.id&&p.public_state.space===actorPublic.space&&p.private_state.hand.length)){
-        const hand=[...target.private_state.hand],stolen=random(hand);
-        actorHand.push(stolen);
-        patches.push({id:target.id,patch:{private_state:{hand:hand.filter(c=>c.id!==stolen.id)}}});
-      }
-      break;
-    }
-    case 'Exploding Candy':{
-      const target=players.find(p=>p.id===choice.targetId);
-      if(!target)return {error:'Choose another player.'};
-      const hand=[...target.private_state.hand],block=hand.find(c=>c.name==='Exploding Candy');
-      const pub=structuredClone(target.public_state);
-      if(block){
-        pub.played.Rowdy.push(block);
-        patches.push({id:target.id,patch:{private_state:{hand:hand.filter(c=>c.id!==block.id)},public_state:pub}});
-        log(`${target.name} blocked the attack with Exploding Candy.`);
-      }else{
-        const returned=returnBars(state,pub,target.user_id,2);
-        patches.push({id:target.id,patch:{public_state:pub}});
-        log(`${target.name} returned ${returned} Wonka Bar(s).`);
-      }
-      break;
-    }
-    case 'Slugworth Sizzler':{
-      for(const target of players.filter(p=>p.private_state.hand.length>=6)){
-        const hand=[...target.private_state.hand],discarded=shuffle(hand).slice(0,hand.length-3);
-        state.discard.push(...discarded);
-        patches.push({id:target.id,patch:{private_state:{hand:hand.filter(c=>!discarded.some(d=>d.id===c.id))}}});
-      }
-      break;
-    }
-    case "Fickelgruber's Fudge":{
-      const target=players.find(p=>p.id===choice.targetId);
-      if(!target)return {error:'Choose another player.'};
-      const pub=structuredClone(target.public_state),available=Object.values(pub.played).flat();
-      if(!available.length)return {error:`${target.name} has no cards below their mat.`};
-      const stolen=random(available);
-      pub.played[stolen.type]=pub.played[stolen.type].filter(c=>c.id!==stolen.id);
-      actorPublic.played[stolen.type].push(stolen);
-      patches.push({id:target.id,patch:{public_state:pub}});
-      break;
-    }
-    case "Fickelgruber's Juicy Bar":{
-      actorPublic.money+=4;
-      const target=players.find(p=>p.id===choice.targetId);
-      if(target?.private_state.hand.length){
-        const hand=[...target.private_state.hand],gift=random(hand),pub=structuredClone(target.public_state);
-        actorHand.push(gift);
-        pub.money+=2;
-        patches.push({id:target.id,patch:{private_state:{hand:hand.filter(c=>c.id!==gift.id)},public_state:pub}});
-      }
-      break;
-    }
-    default:
-      return {error:`${card.name} could not be resolved.`};
-  }
-  return {patches};
+export function sweepNewest(state,publicState,type,count){
+  const stack=publicState.played[type]||[];
+  if(stack.length<count)return [];
+  const swept=stack.slice(-count).reverse();
+  publicState.played[type]=stack.slice(0,-count);
+  state.discard.push(...swept);
+  return swept;
 }
 
-export function resolveSpaceEffect({space,state,actor,publicState,hand,sweepCards=[]}){
-  const discardSweep=(type,count)=>{
-    const cards=(publicState.played[type]||[]).slice(0,count);
-    if(cards.length<count)return false;
-    publicState.played[type]=publicState.played[type].slice(count);
-    state.discard.push(...cards);
-    return true;
-  };
-  let result={ok:true,gained:0};
+export function spaceEligibility(space,publicState){
+  switch(space){
+    case 1:return (publicState.money||0)>=14;
+    case 2:return (publicState.money||0)>=3;
+    case 3:return (publicState.played.Mystery||[]).length>=2;
+    case 4:return (publicState.played.Sweet||[]).length>=3;
+    case 5:return true;
+    case 6:return (publicState.money||0)>=5;
+    case 7:
+    case 8:return true;
+    case 9:return (publicState.played.Rowdy||[]).length>=2;
+    default:return false;
+  }
+}
+
+export function spaceMode(space){
+  return [7,8].includes(space)?'automatic':'playable';
+}
+
+export function resolveSpaceEffect({space,state,actor,publicState,hand,sweepCount=0,discardIds=[]}){
+  if(!spaceEligibility(space,publicState))return {ok:false,error:'This Space Ability is not currently available.'};
+  let barsGained=0,swept=0,needsDiscard=false;
   switch(space){
     case 1:
-      if(publicState.money<14)return {ok:false,error:'You need $14.'};
-      publicState.money-=14; result.gained=takeBars(state,publicState,actor.user_id,6); break;
-    case 2:
-      if(publicState.money<3)return {ok:false,error:'You need $3.'};
-      publicState.money-=3; result.gained=takeBars(state,publicState,actor.user_id,2); break;
-    case 3:
-      if(!discardSweep('Mystery',2))return {ok:false,error:'You need 2 Mystery cards below your mat.'};
-      result.gained=takeBars(state,publicState,actor.user_id,2); break;
-    case 4:
-      if(!discardSweep('Sweet',3))return {ok:false,error:'You need 3 Sweet cards below your mat.'};
-      result.gained=takeBars(state,publicState,actor.user_id,2); break;
-    case 5:{
-      drawCards(state,hand,3);
-      const discard=hand.slice(0,Math.min(2,hand.length));
-      state.discard.push(...discard);
-      hand.splice(0,discard.length);
+      publicState.money-=14;
+      barsGained=takeBars(state,publicState,actor.user_id,6);
       break;
-    }
+    case 2:
+      publicState.money-=3;
+      barsGained=takeBars(state,publicState,actor.user_id,2);
+      break;
+    case 3:
+      swept=sweepNewest(state,publicState,'Mystery',2).length;
+      barsGained=takeBars(state,publicState,actor.user_id,2);
+      break;
+    case 4:
+      swept=sweepNewest(state,publicState,'Sweet',3).length;
+      barsGained=takeBars(state,publicState,actor.user_id,2);
+      break;
+    case 5:
+      if(!discardIds.length){
+        drawCards(state,hand,3,actor.character);
+        return {ok:true,needsDiscard:true,barsGained:0,swept:0};
+      }
+      if(discardIds.length!==2)return {ok:false,error:'Select exactly 2 cards.'};
+      state.discard.push(...hand.filter(c=>discardIds.includes(c.id)));
+      hand.splice(0,hand.length,...hand.filter(c=>!discardIds.includes(c.id)));
+      needsDiscard=false;
+      break;
     case 6:
-      if(publicState.money<5)return {ok:false,error:'You need $5.'};
-      publicState.money-=5; drawCards(state,hand,3); break;
-    case 7: publicState.money+=4; break;
-    case 8: publicState.money=Math.max(publicState.money,actor.allowance); break;
+      publicState.money-=5;
+      drawCards(state,hand,3,actor.character);
+      break;
+    case 7:
+      addCoins(publicState,4);
+      break;
+    case 8:
+      addCoins(publicState,actor.allowance);
+      break;
     case 9:{
-      const count=Math.min(4,sweepCards.length||(publicState.played.Rowdy||[]).length);
-      if(!count)return {ok:false,error:'You have no Rowdy cards to sweep.'};
-      const cards=publicState.played.Rowdy.slice(0,count);
-      publicState.played.Rowdy=publicState.played.Rowdy.slice(count);
-      state.discard.push(...cards);
-      result.gained=takeBars(state,publicState,actor.user_id,count);
+      const available=(publicState.played.Rowdy||[]).length;
+      if(sweepCount<2||sweepCount>Math.min(4,available))return {ok:false,error:'Choose a legal sweep amount from 2 to 4.'};
+      swept=sweepNewest(state,publicState,'Rowdy',sweepCount).length;
+      barsGained=takeBars(state,publicState,actor.user_id,swept);
       break;
     }
     default:return {ok:false,error:`Unknown board space ${space}.`};
   }
   state.log.push(`${actor.name} activated ${SPACES[space-1].name}.`);
-  return result;
+  return {ok:true,barsGained,swept,needsDiscard};
 }
