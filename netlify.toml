@@ -1,8 +1,1 @@
-[build]
-  command = "npm run build"
-  publish = "dist"
-
-[[redirects]]
-  from = "/*"
-  to = "/index.html"
-  status = 200
+<!doctype html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/><meta name="theme-color" content="#32145f"/><title>Golden Ticket Game Beta</title></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
