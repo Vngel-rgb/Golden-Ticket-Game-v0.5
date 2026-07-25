@@ -11,6 +11,8 @@ const emptyPlayed=()=>({Sweet:[],Rowdy:[],Mystery:[]});
 const character=id=>CHARACTERS.find(c=>c.id===id);
 const countByName=cards=>cards.reduce((a,c)=>(a[c.name]=(a[c.name]||0)+1,a),{});
 const randomItem=a=>a[Math.floor(Math.random()*a.length)];
+const eventId=()=>`${Date.now().toString(36)}-${Math.random().toString(36).slice(2,9)}`;
+const responseFor=(player,id)=>player?.private_state?.eventResponses?.[id];
 
 function App(){
  const[session,setSession]=useState(null),[name,setName]=useState(localStorage.getItem('gt_name')||''),[code,setCode]=useState(''),[room,setRoom]=useState(null),[players,setPlayers]=useState([]),[busy,setBusy]=useState(false),[msg,setMsg]=useState('');
@@ -18,10 +20,99 @@ function App(){
  useEffect(()=>{if(!configured)return;supabase.auth.getSession().then(({data})=>setSession(data.session));const{data}=supabase.auth.onAuthStateChange((_e,s)=>setSession(s));return()=>data.subscription.unsubscribe()},[]);
  useEffect(()=>{if(!room?.code||!configured)return;loadRoom(room.code);const ch=supabase.channel(`room-${room.code}`).on('postgres_changes',{event:'*',schema:'public',table:'rooms',filter:`code=eq.${room.code}`},()=>loadRoom(room.code)).on('postgres_changes',{event:'*',schema:'public',table:'players',filter:`room_code=eq.${room.code}`},()=>loadRoom(room.code)).subscribe();return()=>supabase.removeChannel(ch)},[room?.code]);
  const me=players.find(p=>p.user_id===session?.user?.id),isHost=room?.host_id===session?.user?.id,myTurn=room?.state?.phase==='turn'&&me?.seat===room.state.turnSeat;
+ const activeEffect=room?.state?.effect?.status==='collecting'?room.state.effect:null;
  async function auth(){if(session)return session;const{data,error}=await supabase.auth.signInAnonymously();if(error)throw error;return data.session}
  async function loadRoom(c){const[{data:r},{data:p}]=await Promise.all([supabase.from('rooms').select('*').eq('code',c).single(),supabase.from('players').select('*').eq('room_code',c).order('seat')]);if(r){setRoom(r);setPlayers(p||[])}}
  async function patchPlayer(id,patch){const{error}=await supabase.from('players').update(patch).eq('id',id);if(error)throw error}
  async function commitState(next,patches=[]){try{setBusy(true);await Promise.all(patches.map(({id,patch})=>patchPlayer(id,patch)));const{error}=await supabase.from('rooms').update({state:next}).eq('code',room.code);if(error)throw error}catch(e){setMsg(e.message)}finally{setBusy(false)}}
+ function actionFinished(st,type){
+  st.actions=Math.max(0,st.actions-1);
+  st.turnFlags={...(st.turnFlags||{}),normalActions:[...(st.turnFlags?.normalActions||[]),type]};
+  if(me.character==='mike'&&st.turnFlags.normalActions.length===2&&st.turnFlags.normalActions.every(x=>x==='Rowdy')&&!st.turnFlags.mikeOffered)st.turnFlags.mikeOffered=true;
+ }
+ function beginEffect(st,type,meta,eligible){
+  st.phase='effect';
+  st.effect={id:eventId(),type,status:'collecting',actorId:me.id,actorUserId:me.user_id,eligible,meta,createdAt:new Date().toISOString()};
+  st.log.push(`${type} is waiting for ${eligible.length} player response${eligible.length===1?'':'s'}.`);
+ }
+ async function submitEffectResponse(response){
+  const effect=room.state.effect;
+  if(!effect||effect.status!=='collecting'||!effect.eligible.includes(me.user_id)||responseFor(me,effect.id)||busy)return;
+  const privateState=clone(me.private_state);
+  privateState.eventResponses={...(privateState.eventResponses||{}),[effect.id]:response};
+  try{
+   setBusy(true);
+   const{data,error}=await supabase.from('players').update({private_state:privateState}).eq('id',me.id).eq('private_state',me.private_state).select('id').maybeSingle();
+   if(error)throw error;
+   if(!data)await loadRoom(room.code)
+  }catch(e){setMsg(e.message)}finally{setBusy(false)}
+ }
+ async function resolvePendingEffect(effect){
+  if(!effect||effect.status!=='collecting'||busy)return;
+  const ready=effect.eligible.every(uid=>responseFor(players.find(p=>p.user_id===uid),effect.id));
+  if(!ready)return;
+  const claimed=clone(room.state);claimed.effect={...effect,status:'resolving',resolver:session.user.id};
+  const{data:won,error}=await supabase.from('rooms').update({state:claimed}).eq('code',room.code).contains('state',{effect:{id:effect.id,status:'collecting'}}).select('state').maybeSingle();
+  if(error||!won)return;
+  const st=clone(won.state),patches=[],actor=players.find(p=>p.id===effect.actorId);
+  if(!actor)return;
+  const actorPub=clone(actor.public_state),actorPrivate=clone(actor.private_state),actorHand=clone(actorPrivate.hand);
+  if(actorPrivate.eventResponses)delete actorPrivate.eventResponses[effect.id];
+  const cleanResponses=p=>{const next=clone(p.private_state);if(next.eventResponses)delete next.eventResponses[effect.id];return next};
+  let actorChanged=false;
+  if(effect.type==='exploding'){
+   const target=players.find(p=>p.id===effect.meta.targetId),answer=responseFor(target,effect.id),targetPub=clone(target.public_state),targetPrivate=cleanResponses(target),targetHand=clone(targetPrivate.hand);
+   if(answer.choice==='block'){
+    const block=targetHand.find(c=>c.id===answer.cardId&&c.name==='Exploding Candy');
+    if(block){targetPub.played.Rowdy.push(block);targetPrivate.hand=targetHand.filter(c=>c.id!==block.id);st.log.push(`${target.name} blocked Exploding Candy.`)}
+    else returnBars(st,targetPub,target.user_id,2);
+   }else returnBars(st,targetPub,target.user_id,2);
+   patches.push({id:target.id,patch:{private_state:targetPrivate,public_state:targetPub}})
+  }
+  if(effect.type==='slugworth'){
+   for(const uid of effect.eligible){
+    const target=players.find(p=>p.user_id===uid),answer=responseFor(target,effect.id),nextPrivate=cleanResponses(target),hand=clone(nextPrivate.hand),need=effect.meta.required[uid];
+    const ids=(answer.discardIds||[]).filter(id=>hand.some(c=>c.id===id));
+    if(ids.length!==need)continue;
+    st.discard.push(...hand.filter(c=>ids.includes(c.id)));nextPrivate.hand=hand.filter(c=>!ids.includes(c.id));
+    if(target.id===actor.id){actorPrivate.hand=nextPrivate.hand;delete actorPrivate.eventResponses?.[effect.id];actorChanged=true}else patches.push({id:target.id,patch:{private_state:nextPrivate}})
+   }
+  }
+  if(effect.type==='gumdrop'){
+   for(const target of players){
+    const copies=target.private_state.hand.filter(c=>c.name==='Invisible Gumdrop');
+    if(!copies.length)continue;
+    const answer=responseFor(target,effect.id),amount=copies.length===1?1:Math.max(1,Math.min(copies.length,answer?.amount||1));
+    const selected=copies.slice(0,amount),nextPub=target.id===actor.id?actorPub:clone(target.public_state),nextPrivate=target.id===actor.id?actorPrivate:cleanResponses(target);
+    selected.forEach(c=>nextPub.played.Rowdy.push(c));nextPrivate.hand=nextPrivate.hand.filter(c=>!selected.some(s=>s.id===c.id));
+    const gained=takeBars(st,nextPub,target.user_id,amount);
+    if(target.character==='violet'&&gained>=2)drawCards(st,nextPrivate.hand,1);
+    if(target.id===actor.id)actorChanged=true;else patches.push({id:target.id,patch:{private_state:nextPrivate,public_state:nextPub}})
+   }
+  }
+  if(effect.type==='juicy'){
+   for(const uid of effect.eligible){
+    const target=players.find(p=>p.user_id===uid),answer=responseFor(target,effect.id),nextPrivate=cleanResponses(target);
+    if(answer.choice==='give'){
+     const gift=nextPrivate.hand.find(c=>c.id===answer.cardId);
+     if(gift){nextPrivate.hand=nextPrivate.hand.filter(c=>c.id!==gift.id);actorHand.push(gift);const targetPub=clone(target.public_state);addCoins(targetPub,2);patches.push({id:target.id,patch:{private_state:nextPrivate,public_state:targetPub}});continue}
+    }
+    patches.push({id:target.id,patch:{private_state:nextPrivate}})
+   }
+   actorPrivate.hand=actorHand;actorChanged=true
+  }
+  if(actorChanged){
+   if(effect.type!=='slugworth')actorPrivate.hand=effect.type==='juicy'?actorHand:actorPrivate.hand;
+   patches.push({id:actor.id,patch:{private_state:actorPrivate,public_state:actorPub}})
+  }
+  st.phase='turn';st.effect={status:'idle',id:null};st.log.push(`${effect.type} finished resolving.`);
+  await commitState(st,patches)
+ }
+ useEffect(()=>{if(activeEffect)resolvePendingEffect(activeEffect)},[activeEffect?.id,players]);
+ useEffect(()=>{
+  if(!room||!me||room.state.phase!=='turn'||me.seat!==room.state.turnSeat||dialog)return;
+  if(room.state.turnFlags?.mikeOffered&&!room.state.turnFlags?.mikeUsed)setDialog({type:'mike'})
+ },[room?.state?.phase,room?.state?.turnFlags?.mikeOffered,me?.id]);
  async function createRoom(){try{setBusy(true);setMsg('');const s=await auth(),c=roomCode();localStorage.setItem('gt_name',name);const{error}=await supabase.from('rooms').insert({code:c,host_id:s.user.id,status:'lobby',state:{phase:'lobby',log:[`${name} created the room.`]}});if(error)throw error;await supabase.from('players').insert({room_code:c,user_id:s.user.id,name,seat:0,ready:false,character:null,public_state:{money:0,bars:0,space:8,played:emptyPlayed()},private_state:{hand:[]}});await loadRoom(c)}catch(e){setMsg(e.message)}finally{setBusy(false)}}
  async function joinRoom(){try{setBusy(true);setMsg('');const s=await auth(),c=code.trim().toUpperCase();localStorage.setItem('gt_name',name);const{data:r,error}=await supabase.from('rooms').select('*').eq('code',c).single();if(error||!r)throw new Error('Room not found.');const{data:p}=await supabase.from('players').select('*').eq('room_code',c);if(p.some(x=>x.user_id===s.user.id)){await loadRoom(c);return}if(p.length>=5)throw new Error('Room is full.');await supabase.from('players').insert({room_code:c,user_id:s.user.id,name,seat:p.length,ready:false,character:null,public_state:{money:0,bars:0,space:8,played:emptyPlayed()},private_state:{hand:[]}});await loadRoom(c)}catch(e){setMsg(e.message)}finally{setBusy(false)}}
  async function chooseCharacter(id){if(players.some(p=>p.character===id&&p.id!==me.id))return;await patchPlayer(me.id,{character:id,ready:false})}
@@ -90,12 +181,9 @@ function App(){
     const target=players.find(p=>p.id===choice.targetId&&p.id!==me.id&&(p.public_state.bars||0)>=2);
     if(!target)return setMsg('Play not available. Choose an opponent with at least 2 Wonka Bars.');
     playCards();
-    const targetHand=clone(target.private_state.hand),block=targetHand.find(c=>c.name==='Exploding Candy'),targetPub=clone(target.public_state);
-    if(block&&choice.defense!=='accept'){
-     targetPub.played.Rowdy.push(block);
-     patches.push({id:target.id,patch:{private_state:{hand:targetHand.filter(c=>c.id!==block.id)},public_state:targetPub}});
-     st.log.push(`${target.name} blocked Exploding Candy.`)
-    }else{
+    const block=target.private_state.hand.find(c=>c.name==='Exploding Candy'),targetPub=clone(target.public_state);
+    if(block)beginEffect(st,'exploding',{targetId:target.id},[target.user_id]);
+    else{
      returnBars(st,targetPub,target.user_id,2);
      patches.push({id:target.id,patch:{public_state:targetPub}})
     }
@@ -103,25 +191,14 @@ function App(){
    }
    case'Slugworth Sizzler':{
     playCards();
-    for(const target of players.filter(p=>p.private_state.hand.length>=6)){
-     const targetHand=clone(target.private_state.hand),need=targetHand.length-3;
-     const ids=choice.discards?.[target.id];
-     if(!ids||ids.length!==need)return setMsg('Every affected player must select enough cards to discard down to 3.');
-     st.discard.push(...targetHand.filter(c=>ids.includes(c.id)));
-     patches.push({id:target.id,patch:{private_state:{hand:targetHand.filter(c=>!ids.includes(c.id))}}})
-    }
+    const affected=players.filter(p=>p.private_state.hand.length>=6);
+    if(affected.length)beginEffect(st,'slugworth',{required:Object.fromEntries(affected.map(p=>[p.user_id,p.private_state.hand.length-3]))},affected.map(p=>p.user_id));
     break
    }
    case'Invisible Gumdrop':{
     playCards();barsGained+=gainBars(pub,st,used.length);
-    for(const target of players.filter(p=>p.id!==me.id)){
-     const copies=target.private_state.hand.filter(c=>c.name==='Invisible Gumdrop');
-     const amount=Math.max(0,Math.min(copies.length,choice.responses?.[target.id]||copies.length));
-     if(!amount)continue;
-     const selected=copies.slice(0,amount),targetPub=clone(target.public_state),targetHand=clone(target.private_state.hand);
-     selected.forEach(c=>targetPub.played.Rowdy.push(c));gainBars(targetPub,st,amount,target);
-     patches.push({id:target.id,patch:{private_state:{hand:targetHand.filter(c=>!selected.some(s=>s.id===c.id))},public_state:targetPub}})
-    }
+    const remainingCopies=players.map(p=>({p,count:(p.id===me.id?remaining:p.private_state.hand).filter(c=>c.name==='Invisible Gumdrop').length})).filter(x=>x.count);
+    if(remainingCopies.length)beginEffect(st,'gumdrop',{},remainingCopies.filter(x=>x.count>=2).map(x=>x.p.user_id));
     break
    }
    case"Fickelgruber's Fudge":{
@@ -133,12 +210,8 @@ function App(){
    }
    case"Fickelgruber's Juicy Bar":{
     playCards();addCoins(pub,4);
-    for(const target of players.filter(p=>p.id!==me.id&&p.private_state.hand.length)){
-     const giftId=choice.gifts?.[target.id];if(!giftId)continue;
-     const targetHand=clone(target.private_state.hand),gift=targetHand.find(c=>c.id===giftId);if(!gift)continue;
-     const targetPub=clone(target.public_state);remaining.push(gift);addCoins(targetPub,2);
-     patches.push({id:target.id,patch:{private_state:{hand:targetHand.filter(c=>c.id!==giftId)},public_state:targetPub}})
-    }
+    const donors=players.filter(p=>p.id!==me.id&&p.private_state.hand.length);
+    if(donors.length)beginEffect(st,'juicy',{},donors.map(p=>p.user_id));
     break
    }
    case"Tug O' War Taffy":playCards();if(hand.length===1)barsGained+=gainBars(pub,st,3);break;
@@ -155,14 +228,11 @@ function App(){
    case'Scrumdiddlyumptious Bar':playCards();barsGained+=gainBars(pub,st,used.length>=2?3:1);break;
    default:return setMsg(`${card.name} could not be resolved.`)
   }
-  st.actions=Math.max(0,st.actions-1);
+  actionFinished(st,card.type);
   st.log.push(`${me.name} played ${used.length>1?`${used.length}× `:''}${card.name}.`);
-  st.turnFlags={...(st.turnFlags||{}),normalActions:[...(st.turnFlags?.normalActions||[]),card.type]};
   if(me.character==='violet'&&barsGained>=2)drawCards(st,remaining,1);
-  if(me.character==='mike'&&st.turnFlags.normalActions.length===2&&st.turnFlags.normalActions.every(x=>x==='Rowdy')&&!st.turnFlags.mikeOffered){
-   st.turnFlags.mikeOffered=true
-  }
   await commitState(st,[{id:me.id,patch:{private_state:{hand:remaining},public_state:pub}},...patches]);
+  if(st.phase==='effect'){setDialog(null);return}
   if(completedSweep&&me.character==='charlie')setDialog({type:'charlie'});
   else if(st.turnFlags.mikeOffered&&!st.turnFlags.mikeUsed)setDialog({type:'mike'});
   else if(offerSpace)setDialog({type:'spaceEffect',space:offerSpace});
@@ -172,7 +242,6 @@ function App(){
   if(room.state.actions<=0)return setMsg('No Action Points remaining. End your turn.');
   const same=me.private_state.hand.filter(c=>c.name===card.name);
   if(['Scrumdiddlyumptious Bar','Fudgemallow','Extra Hard Rock Candy'].includes(card.name)&&same.length>=2)return setDialog({type:'copies',card,max:2});
-  if(card.name==='Invisible Gumdrop')return setDialog({type:'copies',card,max:same.length,noCancel:true});
   if(card.name==='Triple Cream Cup'){
    const types=['Sweet','Rowdy','Mystery'].filter(type=>(me.public_state.played[type]||[]).length>=3);
    return types.length?setDialog({type:'sweepChoice',card,types}):setDialog({type:'unavailable',message:'You need 3 cards in at least one Player Mat category.'})
@@ -191,8 +260,6 @@ function App(){
    const targets=players.filter(p=>p.id!==me.id&&(p.public_state.bars||0)>=2);
    return targets.length?setDialog({type:'target',card,targets}):setDialog({type:'unavailable',message:'No opponent has at least 2 Wonka Bars.'})
   }
-  if(card.name==='Slugworth Sizzler')return setDialog({type:'globalDiscard',card});
-  if(card.name==="Fickelgruber's Juicy Bar")return setDialog({type:'juicy',card});
   setDialog({type:'confirmPlay',card})
  }
  async function discardMove(card){
@@ -253,7 +320,7 @@ function App(){
  async function fullscreen(){try{if(!document.fullscreenElement)await document.documentElement.requestFullscreen();else await document.exitFullscreen()}catch{setMsg('Fullscreen was blocked by this browser. Use the browser menu instead.')}}
  window.__goldenTicketActivateSpace=activateSpace;
  if(!configured)return <SetupMissing/>;if(!room)return <Landing {...{name,setName,code,setCode,createRoom,joinRoom,busy,msg}}/>;if(room.state.phase==='lobby')return <Lobby {...{room,players,me,isHost,chooseCharacter,toggleReady,startGame,msg,fullscreen}}/>;if(room.state.phase==='opening_discard')return <Opening me={me} onDiscard={openingDiscard}/>;
- return <Game {...{room,players,me,myTurn,msg,busy,requestPlay,setDialog,refill,endTurn,inspect,setInspect,leftOpen,setLeftOpen,logOpen,setLogOpen,fullscreen,activateSpace}} dialog={dialog} resolveCard={resolveCard} discardMove={discardMove} charlieMove={charlieMove} mikeChoice={mikeChoice}/>;
+ return <Game {...{room,players,me,myTurn,msg,busy,requestPlay,setDialog,refill,endTurn,inspect,setInspect,leftOpen,setLeftOpen,logOpen,setLogOpen,fullscreen,activateSpace,submitEffectResponse}} dialog={dialog} resolveCard={resolveCard} discardMove={discardMove} charlieMove={charlieMove} mikeChoice={mikeChoice}/>;
 }
 
 function SetupMissing(){return <main className="center"><section className="systemPanel hero"><h1>Configuration required</h1><p>Add the two public Supabase environment variables in Netlify, then redeploy.</p></section></main>}
@@ -263,8 +330,33 @@ function Opening({me,onDiscard}){const[selected,setSelected]=useState([]),requir
 function Hand({hand,selected=[],onToggle,onPlay,onMove}){return <div className="hand">{hand.map(c=><article key={c.id} className={`card ${c.type.toLowerCase()} ${selected.includes(c.id)?'selected':''}`} onClick={()=>onToggle?.(c.id)}><span>{c.type.toUpperCase()}</span><strong>{c.name}</strong><small>{c.effect}</small>{onPlay&&<div className="cardActions"><button onClick={e=>{e.stopPropagation();onPlay(c)}}>PLAY</button><button className="secondary" onClick={e=>{e.stopPropagation();onMove(c)}}>MOVE</button></div>}</article>)}</div>}
 function PlayerMat({me,myTurn,actions,requestPlay,setDialog,refill,players,setInspect}){const ch=character(me.character),canAct=myTurn&&actions>0;return <><section className="identity"><div><div className="eyebrow">YOUR CHARACTER</div><h2>{ch?.name}</h2><p>{ch?.ability}</p></div><div className="stats"><span>${me.public_state.money}</span><span>ALLOWANCE ${ch?.allowance}</span><span>{me.public_state.bars} BARS</span><span>{actions} AP</span><span>{me.private_state.hand.length} CARDS</span></div></section><section><h3>HAND</h3><Hand hand={me.private_state.hand} onPlay={canAct?requestPlay:null} onMove={canAct?()=>setDialog({type:'moveSelect'}):null}/>{myTurn&&<button className="wide" disabled={!canAct||me.private_state.hand.length>=4} onClick={refill}>REFILL HAND</button>}</section><section><h3>PLAYER MAT</h3>{['Sweet','Rowdy','Mystery'].map(type=><div className="matCategory" key={type}><div><b>{type}</b><span>{(me.public_state.played[type]||[]).length} cards</span></div><div className="miniCards">{(me.public_state.played[type]||[]).map((c,i)=><span key={c.id}>{i+1}. {c.name}</span>)}</div><button disabled>{type.toUpperCase()} SWEEP</button></div>)}</section><section><h3>PLAYERS</h3><div className="playerList">{players.map(p=><div key={p.id}><div><b>{p.name}</b><small>{character(p.character)?.name}</small></div><span>${p.public_state.money} · {p.public_state.bars} bars</span><button className="selectButton" disabled>SELECT</button><button className="tiny" onClick={()=>setInspect(p)}>VIEW</button></div>)}</div></section></>}
 function Board({st,players,me}){const remaining=st.bars.filter(b=>b.owner===null).length;return <><div className="pileRow"><div className="pile"><b>DRAW</b><span>{st.deck.length}</span></div><div className="pile discard"><b>DISCARD</b><span>{st.discard.length}</span></div></div><section className="board">{SPACES.map(s=><article key={s.id} className={`space ${st.wonkaSpace===s.id?'wonka':''} ${me.public_state.space===s.id?'you':''}`}><b>{s.id}. {s.name}</b><small>{s.effect}</small><div className="pawns">{players.filter(p=>p.public_state.space===s.id).map(p=><span className="pawn" title={p.name} key={p.id}>{p.name[0].toUpperCase()}</span>)}{st.wonkaSpace===s.id&&<span className="pawn wonkaPawn">W</span>}</div></article>)}</section><div className="wonkaCounter"><b>WONKA BARS REMAINING</b><span>{remaining}</span></div></>}
-function Game({room,players,me,myTurn,msg,busy,requestPlay,setDialog,refill,endTurn,inspect,setInspect,leftOpen,setLeftOpen,logOpen,setLogOpen,fullscreen,dialog,resolveCard,discardMove,activateSpace,charlieMove,mikeChoice}){const st=room.state,winners=st.phase==='ended'?players.filter(p=>st.bars.some(b=>b.owner===p.user_id&&b.ticket)):[];return <main className="gameShell"><header><b>ROOM {room.code}</b><span>{st.phase==='ended'?'GAME OVER':myTurn?`YOUR TURN · ${st.actions} AP`:`${players.find(p=>p.seat===st.turnSeat)?.name}'S TURN`}</span><div><button className="tiny" onClick={()=>setLeftOpen(!leftOpen)}>MAT</button><button className="tiny" onClick={()=>setLogOpen(!logOpen)}>LOG</button><button className="tiny" onClick={fullscreen}>FULLSCREEN</button></div></header>{st.phase==='ended'&&<section className="systemPanel winner"><h2>{winners.length?`${winners.map(w=>w.name).join(' & ')} WON!`:'NO TICKET WINNER'}</h2></section>}<div className={`gameGrid ${!leftOpen?'leftCollapsed':''} ${!logOpen?'logCollapsed':''}`}><aside className={`sidePanel leftPanel ${leftOpen?'open':''}`}><PlayerMat {...{me,myTurn,requestPlay,setDialog,refill,players,setInspect}} actions={st.actions}/></aside><section className="boardPanel"><Board st={st} players={players} me={me}/>{myTurn&&<div className="turnBar"><span>{st.actions<=0?'No AP remaining — end your turn.':''}</span><button className="gold" disabled={busy} onClick={()=>setDialog({type:'endTurn'})}>END TURN</button></div>}<p className="error">{msg}</p></section><aside className={`sidePanel logPanel ${logOpen?'open':''}`}><h3>GAME LOG</h3>{[...(st.log||[])].reverse().map((x,i)=><p key={i}>{x}</p>)}</aside></div>{inspect&&<Dialog title={inspect.name.toUpperCase()} onClose={()=>setInspect(null)}><p>{character(inspect.character)?.ability}</p><p>${inspect.public_state.money} · {inspect.public_state.bars} bars · {inspect.private_state.hand.length} cards</p>{Object.entries(inspect.public_state.played).map(([t,c])=><p key={t}><b>{t}:</b> {c.length}</p>)}</Dialog>}{dialog&&<GameDialog {...{dialog,me,players,st,onClose:()=>setDialog(null),resolveCard,discardMove,endTurn,activateSpace,charlieMove,mikeChoice}}/>}</main>}
+function Game({room,players,me,myTurn,msg,busy,requestPlay,setDialog,refill,endTurn,inspect,setInspect,leftOpen,setLeftOpen,logOpen,setLogOpen,fullscreen,dialog,resolveCard,discardMove,activateSpace,charlieMove,mikeChoice,submitEffectResponse}){const st=room.state,winners=st.phase==='ended'?players.filter(p=>st.bars.some(b=>b.owner===p.user_id&&b.ticket)):[],effect=st.effect?.status==='collecting'?st.effect:null;return <main className="gameShell"><header><b>ROOM {room.code}</b><span>{st.phase==='ended'?'GAME OVER':effect?'MULTIPLAYER EVENT':myTurn?`YOUR TURN · ${st.actions} AP`:`${players.find(p=>p.seat===st.turnSeat)?.name}'S TURN`}</span><div><button className="tiny" onClick={()=>setLeftOpen(!leftOpen)}>MAT</button><button className="tiny" onClick={()=>setLogOpen(!logOpen)}>LOG</button><button className="tiny" onClick={fullscreen}>FULLSCREEN</button></div></header>{st.phase==='ended'&&<section className="systemPanel winner"><h2>{winners.length?`${winners.map(w=>w.name).join(' & ')} WON!`:'NO TICKET WINNER'}</h2></section>}<div className={`gameGrid ${!leftOpen?'leftCollapsed':''} ${!logOpen?'logCollapsed':''}`}><aside className={`sidePanel leftPanel ${leftOpen?'open':''}`}><PlayerMat {...{me,myTurn,requestPlay,setDialog,refill,players,setInspect}} actions={st.actions}/></aside><section className="boardPanel"><Board st={st} players={players} me={me}/>{myTurn&&<div className="turnBar"><span>{st.actions<=0?'No AP remaining — end your turn.':''}</span><button className="gold" disabled={busy} onClick={()=>setDialog({type:'endTurn'})}>END TURN</button></div>}<p className="error">{msg}</p></section><aside className={`sidePanel logPanel ${logOpen?'open':''}`}><h3>GAME LOG</h3>{[...(st.log||[])].reverse().map((x,i)=><p key={i}>{x}</p>)}</aside></div>{inspect&&<Dialog title={inspect.name.toUpperCase()} onClose={()=>setInspect(null)}><p>{character(inspect.character)?.ability}</p><p>${inspect.public_state.money} · {inspect.public_state.bars} bars · {inspect.private_state.hand.length} cards</p>{Object.entries(inspect.public_state.played).map(([t,c])=><p key={t}><b>{t}:</b> {c.length}</p>)}</Dialog>}{effect&&<EffectDialog {...{effect,me,players,busy,submitEffectResponse}}/>}{!effect&&dialog&&<GameDialog {...{dialog,me,players,st,onClose:()=>setDialog(null),resolveCard,discardMove,endTurn,activateSpace,charlieMove,mikeChoice}}/>}</main>}
 function Dialog({title,children,onClose}){return <div className="overlay" role="dialog" aria-modal="true"><section className="dialog"><div className="dialogHead"><span>SYSTEM</span><button className="tiny" onClick={onClose}>×</button></div><h2>{title}</h2>{children}</section></div>}
+function EffectDialog({effect,me,players,busy,submitEffectResponse}){
+ const[selected,setSelected]=useState([]),[giving,setGiving]=useState(false),answer=responseFor(me,effect.id);
+ const responded=effect.eligible.filter(uid=>responseFor(players.find(p=>p.user_id===uid),effect.id)).length;
+ const waiting=<Dialog title="WAITING FOR PLAYERS"><p>Your response is locked in.</p><p>{responded} of {effect.eligible.length} required responses received.</p></Dialog>;
+ if(!effect.eligible.includes(me.user_id))return <Dialog title="MULTIPLAYER EVENT"><p>{effect.type==='gumdrop'?'Eligible players are choosing how many Invisible Gumdrops to play.':'Waiting for the affected players to respond.'}</p><p>{responded} of {effect.eligible.length} responses received.</p></Dialog>;
+ if(answer)return waiting;
+ if(effect.type==='exploding'){
+  const blocks=me.private_state.hand.filter(c=>c.name==='Exploding Candy');
+  return <Dialog title="EXPLODING CANDY!"><p>You have been targeted.</p><div className="actionRow"><button disabled={busy||!blocks.length} onClick={()=>submitEffectResponse({choice:'block',cardId:blocks[0]?.id})}>PLAY EXPLODING CANDY TO BLOCK</button><button className="secondary" disabled={busy} onClick={()=>submitEffectResponse({choice:'accept'})}>ACCEPT ATTACK</button></div></Dialog>
+ }
+ if(effect.type==='slugworth'){
+  const required=effect.meta.required[me.user_id];
+  const toggle=id=>setSelected(s=>s.includes(id)?s.filter(x=>x!==id):s.length<required?[...s,id]:s);
+  return <Dialog title="SLUGWORTH SIZZLER"><p>Discard exactly {required} card{required===1?'':'s'} to finish with 3.</p><Hand hand={me.private_state.hand} selected={selected} onToggle={toggle}/><button className="wide" disabled={busy||selected.length!==required} onClick={()=>submitEffectResponse({discardIds:selected})}>CONFIRM DISCARD</button></Dialog>
+ }
+ if(effect.type==='gumdrop'){
+  const copies=me.private_state.hand.filter(c=>c.name==='Invisible Gumdrop');
+  return <Dialog title="INVISIBLE GUMDROP"><p>You must play at least one copy.</p><div className="choiceGrid"><button disabled={busy} onClick={()=>submitEffectResponse({amount:1})}>PLAY 1</button><button disabled={busy||copies.length<2} onClick={()=>submitEffectResponse({amount:copies.length})}>PLAY ALL ({copies.length})</button></div></Dialog>
+ }
+ if(effect.type==='juicy'){
+  const toggle=id=>setSelected(s=>s.includes(id)?[]:[id]);
+  return <Dialog title="FICKELGRUBER'S JUICY BAR">{!giving?<><p>Give one card to gain 2 coins?</p><div className="actionRow"><button disabled={busy} onClick={()=>setGiving(true)}>GIVE 1 CARD</button><button className="secondary" disabled={busy} onClick={()=>submitEffectResponse({choice:'none'})}>NO CARD</button></div></>:<><p>Select exactly one card to give.</p><Hand hand={me.private_state.hand} selected={selected} onToggle={toggle}/><div className="actionRow"><button disabled={busy||selected.length!==1} onClick={()=>submitEffectResponse({choice:'give',cardId:selected[0]})}>GIVE CARD</button><button className="secondary" onClick={()=>setGiving(false)}>BACK</button></div></>}</Dialog>
+ }
+ return waiting
+}
 function GameDialog({dialog,me,players,st,onClose,resolveCard,discardMove,endTurn,activateSpace,charlieMove,mikeChoice}){
  const[selected,setSelected]=useState([]),[targetId,setTargetId]=useState(''),[space,setSpace]=useState(null),[sweepCount,setSweepCount]=useState(0);
  const same=dialog.card?me.private_state.hand.filter(c=>c.name===dialog.card.name):[];
@@ -275,7 +367,7 @@ function GameDialog({dialog,me,players,st,onClose,resolveCard,discardMove,endTur
  if(dialog.type==='space')return <Dialog title="CHOOSE A SPACE" onClose={onClose}><div className="choiceGrid">{dialog.spaces.map(n=><button key={n} onClick={()=>resolveCard(dialog.card,{space:n})}>{n}. {SPACES[n-1].name}</button>)}</div><button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
  if(dialog.type==='honey')return <Dialog title="HONEY TEACUP" onClose={onClose}><div className="choiceGrid"><button onClick={()=>resolveCard(dialog.card,{mode:'activate'})}>ACTIVATE SPACE</button><button onClick={()=>resolveCard(dialog.card,{mode:'move'})}>MOVE 2 SPACES</button></div><button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
  if(dialog.type==='sweepChoice')return <Dialog title="TRIPLE CREAM CUP" onClose={onClose}><p>Choose one qualifying category. The 3 newest cards will be swept.</p><div className="choiceGrid">{dialog.types.map(type=><button key={type} onClick={()=>resolveCard(dialog.card,{sweepType:type})}>SWEEP {type.toUpperCase()}</button>)}</div><button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
- if(dialog.type==='target')return <Dialog title="CHOOSE A PLAYER" onClose={onClose}><div className="targetList">{(dialog.targets||players.filter(p=>p.id!==me.id)).map(p=><button key={p.id} onClick={()=>resolveCard(dialog.card,{targetId:p.id})}>{p.name}</button>)}</div><button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
+ if(dialog.type==='target')return <Dialog title={targetId?'CONFIRM ATTACK':'CHOOSE A PLAYER'} onClose={onClose}>{!targetId?<div className="targetList">{(dialog.targets||players.filter(p=>p.id!==me.id)).map(p=><button key={p.id} onClick={()=>dialog.card.name==='Exploding Candy'?setTargetId(p.id):resolveCard(dialog.card,{targetId:p.id})}>{p.name}</button>)}</div>:<><p>Attack {players.find(p=>p.id===targetId)?.name} with Exploding Candy?</p><button className="wide" onClick={()=>resolveCard(dialog.card,{targetId})}>CONFIRM ATTACK</button></>}<button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
  if(dialog.type==='targetThenSpace')return <Dialog title={targetId?'CHOOSE A SPACE':'CHOOSE A PLAYER'} onClose={onClose}>{!targetId?<div className="targetList">{players.filter(p=>p.id!==me.id).map(p=><button key={p.id} onClick={()=>setTargetId(p.id)}>{p.name}</button>)}</div>:<div className="choiceGrid">{SPACES.filter(s=>s.id!==me.public_state.space).map(s=><button key={s.id} onClick={()=>resolveCard(dialog.card,{targetId,space:s.id})}>{s.id}. {s.name}</button>)}</div>}<button className="secondary wide" onClick={onClose}>CANCEL</button></Dialog>;
  if(dialog.type==='matSteal'){
   const targets=dialog.targets||[],target=targets.find(p=>p.id===targetId),cards=target?Object.values(target.public_state.played).flat():[];
